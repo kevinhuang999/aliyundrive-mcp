@@ -1,5 +1,12 @@
 # aliyundrive-mcp
 
+[中文](#中文) | [English](#english)
+
+---
+
+<a id="中文"></a>
+# 中文
+
 > **一句话结论**：把阿里云盘接进 AI 的 MCP 服务器——9 个工具，覆盖「看账号 / 列目录 / 搜文件 / 改名 / 移动 / 建文件夹 / 回收站 / 取下载链接」，让模型用大白话直接操作你的网盘。
 
 基于 [FastMCP](https://github.com/jlowin/fastmcp) 实现，走 **stdio** 协议，可直接挂到任意支持 MCP 的客户端（WorkBuddy、Claude Desktop、Cherry Studio 等）。
@@ -239,3 +246,248 @@ git log --all --name-only | grep -i token   # 应无输出
 ## 声明
 
 本项目为个人自用工具，按现状提供。阿里云盘开放平台接口的可用性、配额与条款以其官方规定为准；使用前请确认你的用法符合相关服务条款。
+
+---
+
+<a id="english"></a>
+# English
+
+> **In one sentence**: an MCP server that plugs Aliyun Drive (Alipan) into AI — 9 tools covering "check account / list directory / search files / rename / move / create folder / recycle bin / get download link", letting the model operate your cloud drive in plain language.
+
+Built on [FastMCP](https://github.com/jlowin/fastmcp) over the **stdio** protocol, it can be attached to any MCP-capable client (WorkBuddy, Claude Desktop, Cherry Studio, etc.).
+
+---
+
+## Table of Contents
+
+- [What It Can Do](#what-it-can-do)
+- [Quick Start](#quick-start)
+- [Tool Reference](#tool-reference)
+- [Connecting to an MCP Client](#connecting-to-an-mcp-client)
+- [Why a Community-Hosted Endpoint](#why-a-community-hosted-endpoint)
+- [How Tokens Are Managed](#how-tokens-are-managed)
+- [Troubleshooting](#troubleshooting)
+- [Security Notes](#security-notes)
+- [Known Limitations](#known-limitations)
+
+---
+
+## What It Can Do
+
+| Scenario | Tool |
+|---|---|
+| "How much space is left on my drive?" | `get_user_info` |
+| "What's in the root directory?" | `list_files` |
+| "Help me find that report" | `search_files` |
+| "Create a folder called 2026 Project" | `create_folder` |
+| "Rename this file to xxx" | `rename_file` |
+| "Move these files to the archive folder" | `move_files` |
+| "Delete this" | `delete_file` (moves to recycle bin — **recoverable**) |
+| "Give me a download link for this file" | `get_download_url` |
+
+**Read-only + limited write**: no uploads, no permanent deletes, no share links. Only metadata and the recycle bin are touched.
+
+---
+
+## Quick Start
+
+### 1. Install dependencies
+
+```bash
+pip install fastmcp requests
+```
+
+(`test_connection.py` uses only the standard library and needs no extra dependencies.)
+
+### 2. Authorize and obtain a token
+
+**Step one — scan the QR code to get a `refresh_token`:**
+
+Open **https://alistgo.com/tool/aliyundrive/request** in a browser.
+
+- Desktop browser: click "Go to login" → scan / log in with Aliyun Drive
+- Mobile: click "Scan QR code" → scan with the Aliyun Drive app
+
+On success the page displays a `refresh_token` string — copy it.
+
+**Step two — exchange it for `token.json`:**
+
+```bash
+python auth.py <pasted refresh_token>
+```
+
+The script does three things automatically: exchanges for an `access_token` → writes `token.json` → **verifies connectivity** (prints the user nickname, drive_id, and capacity usage). Seeing "authorization successful" means you're good.
+
+> To just read the authorization instructions, run `python auth.py` with no arguments.
+
+### 3. Self-check
+
+```bash
+python test_connection.py
+```
+
+It **launches `server.py` over real MCP stdio**, exercises the read-only tools, and confirms "token valid + API paths correct + tools usable":
+
+```
+server -> aliyundrive-mcp vX.Y
+tools  -> 9
+
+[PASS] get_user_info (account + capacity)
+[PASS] list_files (root)
+[PASS] search_files (search)
+
+Self-check passed: token valid, MCP connects normally.
+```
+
+When the MCP panel reports `Connection closed`, **run this first** — it immediately distinguishes a token problem from a code problem.
+
+### 4. Connect to a client
+
+See the next section.
+
+---
+
+## Tool Reference
+
+| Tool | Purpose | Main parameters |
+|---|---|---|
+| `get_user_info` | Account info: nickname, user_id, drive_id, capacity usage | — |
+| `list_files` | List directory contents | `parent_file_id` (default `root`), `limit` (1–200), `order_by`, `order_direction` |
+| `search_files` | Search by filename keyword | `query`, `limit` (1–100) |
+| `get_file_info` | Details for a single file/folder | `file_id` |
+| `create_folder` | Create a folder | `name`, `parent_file_id` (default `root`) |
+| `rename_file` | Rename | `file_id`, `new_name` |
+| `move_files` | **Batch** move (not copy) | `file_ids` (array), `target_parent_id` |
+| `delete_file` | Move to recycle bin (recoverable) | `file_id` |
+| `get_download_url` | Get a temporary download link | `file_id`, `expire_sec` (default 3600 s) |
+
+A few design details:
+
+- **`limit` is clamped**: `list_files` to 1–200, `search_files` to 1–100, so the model can't pass an absurd number and break the API.
+- **`move_files` moves one by one without failing wholesale**: returns `{"moved": [...], "failed": [...]}` — one bad item in a batch doesn't block the rest, and you can see exactly which failed.
+- **`drive_id` is cached**: fetched once via `user/getDriveInfo` and cached in the process rather than re-requested by every tool.
+- **`get_download_url` blocks folders**: folders have no download link, so it returns a clear error instead of an incomprehensible API failure.
+- **File listings are slimmed uniformly**: `_fmt_item` returns only `file_id / name / type / size / updated_at / parent_file_id`, rather than dumping the API's full raw payload on the model (saves tokens).
+
+---
+
+## Connecting to an MCP Client
+
+Add this block to your client's MCP config (**replace the paths with your own absolute paths**):
+
+```json
+{
+  "mcpServers": {
+    "aliyundrive": {
+      "command": "python",
+      "args": ["/absolute/path/aliyundrive-mcp/server.py"],
+      "env": {
+        "ALIPAN_TOKEN_FILE": "/absolute/path/aliyundrive-mcp/token.json"
+      }
+    }
+  }
+}
+```
+
+On Windows, use the full path to `python` for `command` (e.g. `C:\\Python313\\python.exe`) so the client doesn't fail to resolve PATH.
+
+**Two environment variables (both optional):**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ALIPAN_TOKEN_FILE` | `token.json` next to the script | Change where the token is stored (supports multiple accounts) |
+| `ALIPAN_OAUTH_TOKEN_URL` | `https://api.alistgo.com/alist/ali_open/token` | Change the refresh endpoint (for a self-hosted proxy) |
+
+---
+
+## Why a Community-Hosted Endpoint
+
+This is the design trade-off that most needs explaining.
+
+Aliyun Drive's official OAuth refresh endpoint `api.nn.ci` **has been blocked**, and **official individual-developer applications have been suspended since July 2025** — meaning the official route is effectively closed to individual users.
+
+This project therefore uses the AList community-hosted refresh endpoint `api.alistgo.com`. The cost is **dependence on a third-party service's availability**: if that endpoint goes down, this project needs `ALIPAN_OAUTH_TOKEN_URL` changed or a self-hosted proxy.
+
+The good news is that it has nothing to do with your drive data — **it only exchanges a `refresh_token` for an `access_token`**; all actual file operations connect directly to the official `openapi.alipan.com`.
+
+---
+
+## How Tokens Are Managed
+
+```
+refresh_token (expires in ~30 days)
+      │  exchanged by auth.py
+      ▼
+token.json  ──  access_token (~2 hours) + refresh_token + expires_at
+      │
+      │  expires_at reached / API returns 401·403
+      ▼
+Auto-refresh (renews 5 minutes early, no manual intervention)
+```
+
+- **Refreshes 5 minutes early**: `expires_at = now + expires_in - 300`, avoiding occasional failures at the boundary.
+- **Auto-retries once on 401/403**: force-refresh the token, then replay the original request — only once, so no infinite loop.
+- **Write-back failure doesn't block**: if `token.json` isn't writable it only warns; the in-memory token still works until it expires.
+- **⚠️ The `refresh_token` expires in about 30 days**, at which point you need to rescan and reauthorize (see Quick Start step 2).
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `未找到 token 文件` (token file not found) | Not yet authorized, or `ALIPAN_TOKEN_FILE` points wrong | Run `python auth.py <refresh_token>` |
+| `刷新 token 失败 (400) Incorrect GrantType` | Wrong field format for the refresh endpoint | `auth.py` has three built-in format fallbacks; if it still fails the endpoint has changed — update `ALIPAN_OAUTH_TOKEN_URL` |
+| `未被授权 (401/403)` repeatedly | The refresh_token has expired (~30 days) | Rescan and reauthorize |
+| `未能获取 drive_id，账号可能未开通开放平台权限` | The account hasn't enabled the Aliyun Drive open platform | Use another account, or verify open-platform access on the Aliyun Drive side |
+| MCP panel shows `Connection closed` | Either a token problem or a code problem | **Run `python test_connection.py` first** to localize it |
+| Client can't connect, logs are blank | Client can't resolve PATH | Put the full python path in `command` |
+| Error when getting a download link for a folder | Folders simply have no download link | Pass the `file_id` of an actual file |
+
+> **Windows footnote**: `test_connection.py` passes `PATH=""` + `SYSTEMROOT=C:\Windows` when spawning the subprocess, to isolate the environment and prevent parent-process variables from skewing the self-check. This is not a bug.
+
+---
+
+## Security Notes
+
+**`token.json` contains a `refresh_token`, which is equivalent to a long-term key to your cloud drive.**
+
+The repo's `.gitignore` already excludes it:
+
+```gitignore
+# Runtime credentials and caches — do not commit
+token.json
+__pycache__/
+*.pyc
+.env
+```
+
+**Double-check before you push:**
+
+```bash
+git ls-files | grep -i token    # should output nothing
+git log --all --name-only | grep -i token   # should output nothing
+```
+
+The first checks "is it currently tracked"; the second checks "has it ever appeared in history" — **the second matters more**, since a file that was tracked once and deleted still lives on in history.
+
+Two more points:
+
+- Before copying this repo to someone else, confirm `token.json` **wasn't included**.
+- If a token leaks, reauthorize immediately at the authorization page (the old refresh_token becomes invalid).
+
+---
+
+## Known Limitations
+
+- **No upload / no downloading file bodies**: only metadata and links. To fetch a file, use `get_download_url` and download it yourself.
+- **No share links / no batch delete**: `delete_file` handles one at a time; loop for bulk deletion.
+- **`search_files` matches filenames**, not full text (the Aliyun Drive open API doesn't offer full-text search either).
+- **Single account**: one `token.json` per account; use `ALIPAN_TOKEN_FILE` to run multiple server instances for multiple accounts.
+- **Depends on a community endpoint**: see "Why a Community-Hosted Endpoint" above.
+
+---
+
+## Disclaimer
+
+This is a personal-use tool, provided as is. The availability, quotas, and terms of the Aliyun Drive open platform API are governed by its official policies; please confirm your usage complies with the relevant terms of service before use.
